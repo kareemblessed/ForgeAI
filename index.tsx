@@ -11,9 +11,12 @@
  * 2. finishQuiz derives score from (total - wrong.length) to avoid stale setState bug
  * 3. ResultsPage case guards against null mode before rendering (no more mode!)
  */
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
+import './styles/tokens.css';
+import './styles/auth.css';
+import './styles/rooms.css';
 import type { LiveServerMessage, Chat } from '@google/genai';
 import {
   apiGenerateStudyPlan,
@@ -29,13 +32,18 @@ import {
   decode,
   decodeAudioData,
 } from './api';
-import type { Mode, Topic, AnalysisResult, MnemonicResult, QuizQuestion, ChatMessage } from './api';
-import { supabase } from './supabase/client';
+import type { Mode, Topic, AnalysisResult, MnemonicResult, QuizQuestion, ChatMessage, RetrievedPassage } from './api';
+import { indexSources, retrieve, hasIndex, deleteIndex, clearAllIndexes } from './rag';
+import type { RagSource } from './rag';
+import { supabase, supabaseConfigured } from './supabase/client';
 import type { Profile } from './supabase/client';
 import AuthPage from './components/AuthPage';
-import ForgeRoom from './components/ForgeRoom';
+import RoomLobby from './components/RoomLobby';
 import MD from './components/MD'; // ✅ FIX 1: import from shared component — duplicate inline MD removed below
 import type { User } from '@supabase/supabase-js';
+
+// The room pulls in realtime/quiz/video code most sessions never need — load it on demand.
+const ForgeRoom = lazy(() => import('./components/ForgeRoom'));
 
 // ── Types ────────────────────────────────────────────────────
 type AppView = 'home' | 'upload' | 'loading' | 'results' | 'study' | 'quiz' | 'quiz-summary' | 'room-lobby' | 'room';
@@ -51,12 +59,24 @@ type HistoryItem = {
   analysis: AnalysisResult;
 };
 
+// Retrieval index status for the current study plan (see rag.ts)
+type RagState = {
+  status: 'none' | 'indexing' | 'ready' | 'error';
+  phase?: 'reading' | 'embedding';
+  done: number;
+  total: number;
+  chunks: number;
+  failed: string[];
+};
+const RAG_NONE: RagState = { status: 'none', done: 0, total: 0, chunks: 0, failed: [] };
+
 // ── Constants ────────────────────────────────────────────────
 const ALLOWED_MIME_TYPES = [
   'application/pdf','text/plain','image/jpeg','image/png',
   'image/gif','image/webp','audio/mpeg','audio/mp3',
   'audio/wav','audio/mp4','audio/x-m4a',
 ];
+const HISTORY_LIMIT = 20;
 const MAX_AUDIO = 20 * 1024 * 1024;
 const MAX_DEFAULT = 10 * 1024 * 1024;
 
@@ -96,7 +116,7 @@ const truncate = (name: string, max = 20) => {
 const BackgroundEffects = ({ mode }: { mode: Mode | null }) => {
   const tc = getStatus(mode).themeClass;
   const particles = useMemo(() => {
-    const count = tc === 'theme-zoom' ? 50 : tc === 'theme-neutral' ? 0 : 20;
+    const count = tc === 'theme-zoom' ? 18 : tc === 'theme-neutral' ? 0 : 10;
     return Array.from({ length: count }, (_, i) => ({
       id: i,
       left: `${Math.random() * 100}%`,
@@ -108,7 +128,7 @@ const BackgroundEffects = ({ mode }: { mode: Mode | null }) => {
   }, [tc]);
   const lines = useMemo(() => {
     if (tc !== 'theme-warn') return [];
-    return Array.from({ length: 10 }, (_, i) => ({
+    return Array.from({ length: 6 }, (_, i) => ({
       id: i,
       width: `${Math.random() * 30 + 20}vw`,
       top: `${Math.random() * 120 - 10}%`,
@@ -416,8 +436,30 @@ const MnemonicStudio = ({ topic, onUpdate }: { topic: Topic; onUpdate: (t: Topic
   );
 };
 
+// ── RAG status line shown above the chat input ────────────────
+const RagBadge = ({ rag }: { rag: RagState }) => {
+  if (rag.status === 'none') return null;
+  let text: string;
+  if (rag.status === 'indexing') {
+    text = rag.phase === 'embedding'
+      ? `Indexing your documents… ${rag.done}/${rag.total} passages`
+      : `Reading your documents… ${rag.done}/${rag.total}`;
+  } else if (rag.status === 'ready') {
+    text = `Answers use ${rag.chunks} passages from your documents`
+      + (rag.failed.length ? ` (couldn't read: ${rag.failed.join(', ')})` : '');
+  } else {
+    text = 'Couldn\'t index your documents — answering from the study notes only';
+  }
+  return (
+    <div className={`rag-badge ${rag.status}`} role="status" aria-live="polite">
+      {rag.status === 'indexing' && <span className="loading-spinner small-inline" />}
+      <span>{rag.status === 'ready' ? '📚 ' : ''}{text}</span>
+    </div>
+  );
+};
+
 // ── ChatStudio ────────────────────────────────────────────────
-const ChatStudio = ({ topic }: { topic: Topic }) => {
+const ChatStudio = ({ topic, planId, rag }: { topic: Topic; planId: string | null; rag: RagState }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([{ role: 'model', text: "I've reviewed the notes. Ask me anything!" }]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -428,8 +470,10 @@ const ChatStudio = ({ topic }: { topic: Topic }) => {
   const endRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { setInit(true); setChat(apiCreateChatForTopic(topic)); setInit(false); }, [topic]);
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  // Rebuild the chat only when the notes actually change. `topic` gets a new object identity on
+  // unrelated updates (e.g. saving a mnemonic), which used to reset the model's memory mid-conversation.
+  useEffect(() => { setInit(true); setChat(apiCreateChatForTopic(topic)); setInit(false); }, [topic.topic, topic.notes]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: loading ? 'auto' : 'smooth', block: 'end' }); }, [messages]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const clearImg = () => { setImgFile(null); setImgPreview(null); if (imgRef.current) imgRef.current.value = ''; };
 
@@ -440,7 +484,18 @@ const ChatStudio = ({ topic }: { topic: Topic }) => {
     setMessages(prev => [...prev, { role: 'user', text: input, imageUrl: imgPreview ?? undefined }, { role: 'model', text: '' }]);
     setInput(''); clearImg(); setLoading(true);
     try {
-      const stream = await apiChatWithDocumentsStream(chat, cur, curImg ?? undefined);
+      // RAG: fetch the passages of the student's own documents that best match the question.
+      // Any failure here just means we answer from the notes, as before.
+      let passages: RetrievedPassage[] = [];
+      if (rag.status === 'ready' && planId && cur.trim()) {
+        try { passages = await retrieve(planId, `${topic.topic}: ${cur}`); }
+        catch (err) { console.warn('Retrieval failed, answering from notes:', err); }
+      }
+      if (passages.length) {
+        const sources = [...new Set(passages.map(p => p.source))];
+        setMessages(prev => { const last = prev[prev.length - 1]; return [...prev.slice(0, -1), { ...last, sources }]; });
+      }
+      const stream = await apiChatWithDocumentsStream(chat, cur, curImg ?? undefined, passages);
       for await (const chunk of stream) {
         const t = chunk.text ?? '';
         setMessages(prev => { const last = prev[prev.length - 1]; return [...prev.slice(0, -1), { ...last, text: last.text + t }]; });
@@ -459,10 +514,17 @@ const ChatStudio = ({ topic }: { topic: Topic }) => {
           <div key={i} className={`chat-message ${msg.role}`}>
             {msg.imageUrl && <img src={msg.imageUrl} alt="upload" className="chat-image" />}
             {msg.text && <MD text={msg.text} />}
+            {!!msg.sources?.length && (
+              <div className="chat-sources" aria-label="Sources from your documents">
+                <span className="chat-sources-label">📚 From your documents</span>
+                {msg.sources.map((s, n) => <span key={n} className="chat-source">{s}</span>)}
+              </div>
+            )}
           </div>
         ))}
         <div ref={endRef} />
       </div>
+      <RagBadge rag={rag} />
       {imgPreview && (
         <div className="chat-image-preview-container">
           <img src={imgPreview} alt="preview" className="chat-image-preview" />
@@ -552,8 +614,8 @@ const InlineQuiz = ({ topic }: { topic: Topic }) => {
 // ── StudyPage ─────────────────────────────────────────────────
 type HubTab = 'chat' | 'tutor' | 'quiz';
 
-const StudyPage = ({ topic, onBack, onUpdate, onStartTutor }: {
-  topic: Topic; onBack: () => void;
+const StudyPage = ({ topic, planId, rag, onBack, onUpdate, onStartTutor }: {
+  topic: Topic; planId: string | null; rag: RagState; onBack: () => void;
   onUpdate: (t: Topic) => void; onStartTutor: (t: Topic) => void;
 }) => {
   const [tab, setTab] = useState<HubTab>('chat');
@@ -603,7 +665,7 @@ const StudyPage = ({ topic, onBack, onUpdate, onStartTutor }: {
           </div>
 
           <div className="forge-hub-panel-body">
-            {tab === 'chat' && <ChatStudio topic={topic} />}
+            {tab === 'chat' && <ChatStudio topic={topic} planId={planId} rag={rag} />}
             {tab === 'tutor' && (
               <div className="forge-tutor-tab">
                 <div className="forge-tutor-icon">🤖</div>
@@ -723,7 +785,7 @@ const LiveTutorView = ({ topic, onEnd }: { topic: Topic; onEnd: () => void }) =>
   const inTextRef           = useRef('');
 
   const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [transcript]);
+  useEffect(() => { endRef.current?.scrollIntoView({ block: 'end' }); }, [transcript]);
 
   // ── Enqueue one audio chunk onto the sequential play chain ──
   const enqueueChunk = useCallback((b64: string) => {
@@ -785,7 +847,7 @@ const LiveTutorView = ({ topic, onEnd }: { topic: Topic; onEnd: () => void }) =>
         outCtxRef.current = new AC({ sampleRate: 24000 });
         nextStartRef.current = 0;
 
-        sessionRef.current = await apiConnectLiveTutor(topic, {
+        const session: any = await apiConnectLiveTutor(topic, {
           onopen: () => {
             if (cancelled) return;
             setStatus('connected');
@@ -853,11 +915,20 @@ const LiveTutorView = ({ topic, onEnd }: { topic: Topic; onEnd: () => void }) =>
           },
         });
 
+        // Closed while still connecting: nothing else will ever close this session, so do it here
+        if (cancelled) { session?.close?.(); return; }
+        sessionRef.current = session;
+
       } catch (e) {
         console.error(e);
         if (!cancelled) {
+          const micProblem = e instanceof DOMException && ['NotAllowedError', 'NotFoundError', 'SecurityError'].includes(e.name);
           setStatus('error');
-          setTranscript(prev => [...prev, { role: 'status', text: 'Could not access microphone. Check permissions.', id: Date.now() }]);
+          setTranscript(prev => [...prev, {
+            role: 'status',
+            text: micProblem ? 'Could not access microphone. Check permissions.' : 'Could not connect to the live tutor. Please try again.',
+            id: Date.now(),
+          }]);
         }
       }
     })();
@@ -872,7 +943,7 @@ const LiveTutorView = ({ topic, onEnd }: { topic: Topic; onEnd: () => void }) =>
       outCtxRef.current?.close().catch(() => {});
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [topic]);
+  }, [topic.topic, topic.notes]); // not `topic`: a new object identity must not restart a live session
 
   const statusLabel =
     status === 'connecting'   ? 'Connecting…' :
@@ -981,100 +1052,6 @@ const HistoryModal = ({ open, history, onClose, onLoad, onDelete, onClear }: {
   );
 };
 
-// ── RoomLobby ─────────────────────────────────────────────────
-const RoomLobby = ({ userId, analysis, onEnter, onBack }: {
-  userId: string; analysis: AnalysisResult | null;
-  onEnter: (id: string) => void; onBack: () => void;
-}) => {
-  const [name, setName] = useState('');
-  const [token, setToken] = useState('');
-  const [creating, setCreating] = useState(false);
-  const [joining, setJoining] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const create = async () => {
-    if (!name.trim()) { setErr('Enter a room name.'); return; }
-    setCreating(true); setErr(null);
-    try {
-      const { data: { session } } = await supabase.auth.getSession();
-      const jwt = session?.access_token;
-
-      let dailyUrl: string | null = null;
-      try {
-        const res = await fetch('/api/room', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${jwt ?? ''}` },
-          body: JSON.stringify({ roomName: name.trim().toLowerCase().replace(/\s+/g, '-') }),
-        });
-        if (res.ok) { const d = await res.json() as { url: string }; dailyUrl = d.url; }
-      } catch { /* video optional */ }
-
-      const { data, error } = await supabase
-        .from('rooms')
-        .insert({ name: name.trim(), host_id: userId, topic_context: analysis ?? null, daily_room_url: dailyUrl })
-        .select('id')
-        .single();
-
-      if (error) throw error;
-      onEnter((data as { id: string }).id);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Failed to create room.');
-    } finally { setCreating(false); }
-  };
-
-  const join = async () => {
-    if (!token.trim()) { setErr('Enter a room code.'); return; }
-    setJoining(true); setErr(null);
-    try {
-      const { data, error } = await supabase
-        .from('rooms')
-        .select('id')
-        .eq('join_token', token.trim())
-        .eq('is_active', true)
-        .maybeSingle();
-
-      if (error || !data) { setErr('Room not found. Check the code.'); return; }
-      onEnter((data as { id: string }).id);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Failed to join room.');
-    } finally { setJoining(false); }
-  };
-
-  return (
-    <section className="room-lobby view-container">
-      <header className="page-header">
-        <button className="back-button" onClick={onBack}>&larr; Back</button>
-        <h1>Forge Room</h1>
-        <p className="subtitle">Study together with video, shared AI, and quiz battles.</p>
-      </header>
-      {err && <div className="error-message">{err}</div>}
-      <div className="room-lobby-grid">
-        <div className="room-lobby-card">
-          <div className="room-lobby-icon">⚡</div>
-          <h2>Create a Room</h2>
-          <p>Start a session and share the link with your group.</p>
-          <input className="room-lobby-input" type="text" placeholder="Room name e.g. Thermo Exam Prep"
-            value={name} onChange={e => setName(e.target.value)} />
-          <button className="room-lobby-btn primary" onClick={create} disabled={creating}>
-            {creating ? 'Creating...' : '⚡ Create Room'}
-          </button>
-        </div>
-        <div className="room-lobby-or">or</div>
-        <div className="room-lobby-card">
-          <div className="room-lobby-icon">🔗</div>
-          <h2>Join a Room</h2>
-          <p>Enter the 8-character code from your friend's link.</p>
-          <input className="room-lobby-input" type="text" placeholder="Room code e.g. ab3x9f2c"
-            value={token} onChange={e => setToken(e.target.value.toLowerCase())} maxLength={8} />
-          <button className="room-lobby-btn" onClick={join} disabled={joining}>
-            {joining ? 'Joining...' : '🔗 Join Room'}
-          </button>
-        </div>
-      </div>
-    </section>
-  );
-};
-
 // ════════════════════════════════════════════════════════════
 // APP
 // ════════════════════════════════════════════════════════════
@@ -1096,8 +1073,15 @@ const App = () => {
   const [quizSum, setQuizSum]   = useState<{ score: number; total: number; reflection: string } | null>(null);
   const [tutorOn, setTutorOn]   = useState(false);
   const [hlTopic, setHlTopic]   = useState<string | null>(null);
-  const [history, setHistory]   = useState<HistoryItem[]>([]);
+  const [history, setHistory]   = useState<HistoryItem[]>(() => {
+    try { return JSON.parse(localStorage.getItem('forgeai_history') ?? '[]') as HistoryItem[]; } catch { return []; }
+  });
   const [histOpen, setHistOpen] = useState(false);
+
+  // Retrieval index for the current study plan (see rag.ts)
+  const [planId, setPlanId] = useState<string | null>(null);
+  const [rag, setRag]       = useState<RagState>(RAG_NONE);
+  const planIdRef = useRef<string | null>(null); // lets async indexing ignore a plan the user has left
 
   // Room state
   const [roomId, setRoomId] = useState<string | null>(null);
@@ -1106,33 +1090,52 @@ const App = () => {
 
   // ── Auth listener ────────────────────────────────────────
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setUser(data.session?.user ?? null);
-      setAuthReady(true);
-    });
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => {
-      setUser(s?.user ?? null);
+    // If Supabase can't be reached, still leave the loading screen (the login form shows its own errors)
+    supabase.auth.getSession()
+      .then(({ data }) => setUser(data.session?.user ?? null))
+      .catch(() => setUser(null))
+      .finally(() => setAuthReady(true));
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, sess) => {
+      setUser(sess?.user ?? null);
     });
     return () => subscription.unsubscribe();
   }, []);
 
+  // Effects below key on user?.id: Supabase hands us a NEW user object on every token refresh,
+  // which would otherwise re-run them (and e.g. drag you back into a room you just left).
+  const userId = user?.id;
+
   useEffect(() => {
     if (!user) { setProfile(null); return; }
-    supabase.from('profiles').select('*').eq('id', user.id).single().then(({ data }) => {
-      if (data) setProfile(data as Profile);
-    });
-  }, [user]);
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle();
+      if (cancelled) return;
+      if (data) { setProfile(data as Profile); return; }
+      // Accounts created before the signup trigger existed have no profile row, and rooms
+      // won't open without one — create it.
+      const name = (user.user_metadata?.display_name as string | undefined) || user.email?.split('@')[0] || 'Student';
+      const { data: created } = await supabase.from('profiles').insert({ id: user.id, display_name: name }).select().single();
+      if (!cancelled && created) setProfile(created as Profile);
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
 
-  // Check for room token in URL
+  // Join a room from an invite link (?room=<code>), once
   useEffect(() => {
-    if (!user) return;
+    if (!userId) return;
     const params = new URLSearchParams(window.location.search);
-    const t = params.get('room');
+    const t = params.get('room')?.trim().toLowerCase();
     if (!t) return;
+    // Clear it so a refresh, or a later re-render, doesn't pull you back into the room
+    params.delete('room');
+    const qs = params.toString();
+    window.history.replaceState(null, '', window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash);
     supabase.from('rooms').select('id').eq('join_token', t).eq('is_active', true).maybeSingle().then(({ data }) => {
       if (data) { setRoomId((data as { id: string }).id); setView('room'); }
     });
-  }, [user]);
+  }, [userId]);
 
   // Apply theme
   useEffect(() => {
@@ -1145,14 +1148,33 @@ const App = () => {
 
   // History persistence
   useEffect(() => {
-    try { const s = localStorage.getItem('forgeai_history'); if (s) setHistory(JSON.parse(s) as HistoryItem[]); } catch { /* ignore */ }
-  }, []);
-  useEffect(() => {
     try { localStorage.setItem('forgeai_history', JSON.stringify(history)); } catch { /* ignore */ }
   }, [history]);
 
   // ── Handlers ─────────────────────────────────────────────
+  // Index the uploads in the background so the plan appears immediately; chat starts
+  // using the documents as soon as this finishes.
+  const startIndexing = useCallback(async (id: string, sources: RagSource[]) => {
+    const current = () => planIdRef.current === id;
+    planIdRef.current = id; setPlanId(id);
+    if (!sources.length) { setRag(RAG_NONE); return; }
+    setRag({ status: 'indexing', phase: 'reading', done: 0, total: sources.length, chunks: 0, failed: [] });
+    try {
+      const res = await indexSources(id, sources, p => {
+        if (current()) setRag(prev => ({ ...prev, status: 'indexing', phase: p.phase, done: p.done, total: p.total }));
+      });
+      if (!current()) return;
+      setRag(res.chunks
+        ? { status: 'ready', done: res.chunks, total: res.chunks, chunks: res.chunks, failed: res.failedFiles }
+        : { status: 'error', done: 0, total: 0, chunks: 0, failed: res.failedFiles });
+    } catch (e) {
+      console.error('Indexing failed:', e);
+      if (current()) setRag({ status: 'error', done: 0, total: 0, chunks: 0, failed: [] });
+    }
+  }, []);
+
   const reset = () => {
+    planIdRef.current = null; setPlanId(null); setRag(RAG_NONE);
     setView('home'); setMode(null); setFiles([null,null,null]); setYtUrl('');
     setError(null); setAnalysis(null); setTopic(null); setQuizQs(null);
     setQuizSum(null); setHlTopic(null); setTutorOn(false);
@@ -1181,8 +1203,15 @@ const App = () => {
       }
       const initial = await apiGenerateStudyPlan(mode, valid, ytUrl.trim() || undefined, ytTranscript);
       const hItem: HistoryItem = { id: Date.now().toString(), timestamp: Date.now(), mode: mode!, analysis: initial, files: valid.map(f => ({ name: f.name, size: f.size, type: f.type })), youtubeUrl: ytUrl.trim() || undefined };
-      setHistory(prev => [hItem, ...prev]);
+      // Keep the newest 20 plans: each one stores its notes in localStorage (~5 MB total), and once
+      // that quota is hit every later save fails silently. Drop the retrieval indexes of evicted plans too.
+      setHistory(prev => [hItem, ...prev].slice(0, HISTORY_LIMIT));
+      history.slice(HISTORY_LIMIT - 1).forEach(old => void deleteIndex(old.id));
       setAnalysis(initial); setView('results');
+
+      const ragSources: RagSource[] = valid.map(f => ({ name: f.name, file: f }));
+      if (ytTranscript) ragSources.push({ name: 'YouTube transcript', text: ytTranscript });
+      void startIndexing(hItem.id, ragSources);
 
       // Generate notes sequentially
       const done: Topic[] = [];
@@ -1212,7 +1241,7 @@ const App = () => {
   }, [updateTopic]);
 
   const startQuiz = async (t: Topic) => {
-    setTopic(t); setView('loading');
+    setError(null); setTopic(t); setView('loading');
     try {
       const qs = await apiGeneratePracticeQuiz(t);
       if (!qs.length) throw new Error('No questions generated.');
@@ -1244,9 +1273,29 @@ const App = () => {
     setYtUrl(item.youtubeUrl ?? '');
     setView('results');
     setHistOpen(false);
+
+    // Re-attach the retrieval index saved (in this browser) when the plan was created
+    planIdRef.current = item.id; setPlanId(item.id); setRag(RAG_NONE);
+    hasIndex(item.id).then(n => {
+      if (planIdRef.current === item.id && n > 0) setRag({ status: 'ready', done: n, total: n, chunks: n, failed: [] });
+    });
   };
 
   // ── Auth loading ─────────────────────────────────────────
+  if (!supabaseConfigured) {
+    return (
+      <div className="loading-view" role="alert" style={{ textAlign: 'center', padding: 24, gap: 12 }}>
+        <div style={{ fontSize: 40 }}>⚙️</div>
+        <div className="loading-text" style={{ marginTop: 0 }}>Supabase isn't configured</div>
+        <p style={{ color: 'var(--text-secondary)', maxWidth: 460, lineHeight: 1.6 }}>
+          Create a <code>.env.local</code> file next to <code>package.json</code> with{' '}
+          <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> (see <code>.env.example</code>),
+          then restart <code>npm run dev</code>.
+        </p>
+      </div>
+    );
+  }
+
   if (!authReady) {
     return <div className="loading-view"><div className="loading-spinner" /><div className="loading-text">Loading Forge AI...</div></div>;
   }
@@ -1257,12 +1306,14 @@ const App = () => {
   // ── Full-screen room ─────────────────────────────────────
   if (view === 'room' && roomId && profile) {
     return (
-      <ForgeRoom
-        roomId={roomId}
-        userId={user.id}
-        userProfile={profile}
-        onLeave={() => { setRoomId(null); setView(analysis ? 'results' : 'home'); }}
-      />
+      <Suspense fallback={<div className="fr-loading"><div className="loading-spinner" /><p>Joining study room…</p></div>}>
+        <ForgeRoom
+          roomId={roomId}
+          userId={user.id}
+          userProfile={profile}
+          onLeave={() => { setRoomId(null); setView(analysis ? 'results' : 'home'); }}
+        />
+      </Suspense>
     );
   }
 
@@ -1282,6 +1333,7 @@ const App = () => {
           <main>
             <RoomLobby
               userId={user.id}
+              profile={profile}
               analysis={analysis}
               onEnter={id => { setRoomId(id); setView('room'); }}
               onBack={() => setView(analysis ? 'results' : 'home')}
@@ -1324,7 +1376,7 @@ const App = () => {
 
       case 'study':
         return <StudyPage
-          topic={topic!}
+          topic={topic!} planId={planId} rag={rag}
           onBack={() => { setHlTopic(topic?.topic ?? null); setView('results'); setTopic(null); }}
           onUpdate={updateTopic}
           onStartTutor={t => { setTopic(t); setTutorOn(true); }}
@@ -1375,13 +1427,31 @@ const App = () => {
       <HistoryModal
         open={histOpen} history={history}
         onClose={() => setHistOpen(false)} onLoad={loadHistory}
-        onDelete={id => setHistory(prev => prev.filter(i => i.id !== id))}
-        onClear={() => { if (window.confirm('Delete all history?')) setHistory([]); }}
+        onDelete={id => { setHistory(prev => prev.filter(i => i.id !== id)); void deleteIndex(id); }}
+        onClear={() => { if (window.confirm('Delete all history?')) { setHistory([]); void clearAllIndexes(); } }}
       />
     </>
   );
 };
 
+// Without a boundary, one render error anywhere unmounts the whole app and leaves a blank page.
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error, info: React.ErrorInfo) { console.error('Unhandled UI error:', error, info.componentStack); }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="loading-view" role="alert" style={{ textAlign: 'center', padding: 24, gap: 12 }}>
+        <div style={{ fontSize: 40 }}>😵</div>
+        <div className="loading-text" style={{ marginTop: 0 }}>Something went wrong</div>
+        <p style={{ color: 'var(--text-secondary)', maxWidth: 420 }}>{this.state.error.message}</p>
+        <button className="reset-button" onClick={() => window.location.reload()}>Reload</button>
+      </div>
+    );
+  }
+}
+
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
-  <React.StrictMode><App /></React.StrictMode>
+  <React.StrictMode><ErrorBoundary><App /></ErrorBoundary></React.StrictMode>
 );
