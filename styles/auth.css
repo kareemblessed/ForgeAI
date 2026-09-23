@@ -1,0 +1,198 @@
+/* ================================================================
+   FORGE AI — sign in / create account
+   Static gradients only: no backdrop-filter, no looping animations,
+   so this screen costs nothing once it has painted.
+================================================================ */
+.auth-shell {
+    position: relative;
+    z-index: 2;
+    min-height: 100dvh;
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+    background:
+        radial-gradient(900px 520px at 8% 6%, rgba(111, 99, 224, 0.30), transparent 60%),
+        radial-gradient(760px 520px at 96% 100%, rgba(70, 232, 255, 0.10), transparent 60%),
+        var(--forge-bg);
+}
+
+/* ── Left: brand panel ───────────────────────────────────────── */
+.auth-hero {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 40px;
+    padding: 48px 56px;
+    border-right: 1px solid var(--forge-line);
+}
+.auth-brand { display: inline-flex; align-items: center; gap: 12px; }
+.auth-mark {
+    width: 40px; height: 40px; border-radius: 12px;
+    display: grid; place-items: center; color: #fff;
+    background: linear-gradient(135deg, var(--forge-accent-hi), var(--forge-accent));
+    box-shadow: 0 8px 24px rgba(83, 74, 183, 0.45);
+}
+.auth-brand-name { font-size: 1.5rem; font-weight: 800; letter-spacing: -0.5px; }
+
+.auth-headline {
+    font-size: clamp(2rem, 3.6vw, 3.1rem);
+    line-height: 1.08;
+    font-weight: 800;
+    letter-spacing: -1.5px;
+    margin-bottom: 16px;
+}
+.auth-headline em {
+    font-style: normal;
+    background: linear-gradient(90deg, #b9b2ff, #7ee7ff);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.auth-lede { color: var(--forge-muted); font-size: 1.05rem; line-height: 1.6; max-width: 460px; }
+
+.auth-features { list-style: none; display: grid; gap: 14px; margin-top: 28px; }
+.auth-features li { display: flex; align-items: center; gap: 14px; color: #d8d8e8; font-size: 0.95rem; }
+.auth-feature-icon {
+    flex-shrink: 0; width: 36px; height: 36px; border-radius: 10px;
+    display: grid; place-items: center;
+    background: var(--forge-accent-soft); color: var(--forge-accent-text);
+    border: 1px solid rgba(175, 169, 236, 0.22);
+}
+
+/* Static "room" preview so people see what they're signing in to */
+.auth-mock {
+    max-width: 440px;
+    background: var(--forge-surface);
+    border: 1px solid var(--forge-line);
+    border-radius: 16px;
+    padding: 16px;
+    box-shadow: var(--forge-shadow);
+}
+.auth-mock-head { display: flex; align-items: center; gap: 10px; font-size: 0.85rem; font-weight: 600; margin-bottom: 14px; }
+.auth-mock-code { font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace; font-size: 0.72rem; color: var(--forge-muted); background: rgba(255,255,255,0.06); padding: 2px 7px; border-radius: 6px; }
+.auth-mock-live { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 0.75rem; color: var(--forge-ok); }
+.auth-mock-live i { width: 7px; height: 7px; border-radius: 50%; background: var(--forge-ok); }
+.auth-mock-rows { display: grid; gap: 9px; }
+.auth-mock-row { display: grid; grid-template-columns: 26px 1fr 34px; align-items: center; gap: 10px; font-size: 0.78rem; }
+.auth-mock-av { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font-size: 0.62rem; font-weight: 700; }
+.auth-mock-bar { height: 7px; border-radius: 4px; background: rgba(255,255,255,0.07); overflow: hidden; }
+.auth-mock-bar i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, var(--forge-accent), var(--forge-accent-hi)); }
+.auth-mock-pts { text-align: right; font-weight: 700; color: var(--forge-accent-text); }
+
+/* ── Right: form ─────────────────────────────────────────────── */
+.auth-panel { display: grid; place-items: center; padding: 32px 24px; }
+.auth-card {
+    width: 100%; max-width: 440px;
+    background: var(--forge-surface);
+    border: 1px solid var(--forge-line);
+    border-radius: var(--forge-radius-lg);
+    padding: 34px;
+    box-shadow: var(--forge-shadow);
+    animation: fadeIn 0.35s ease-out;
+}
+.auth-title { font-size: 1.6rem; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 6px; }
+.auth-subtitle { color: var(--forge-muted); font-size: 0.95rem; margin-bottom: 22px; }
+
+/* segmented tabs with a sliding thumb */
+.auth-tabs {
+    position: relative; display: grid; grid-template-columns: 1fr 1fr;
+    padding: 4px; margin-bottom: 24px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--forge-line);
+    border-radius: 12px;
+}
+.auth-tab-thumb {
+    position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 4px);
+    background: var(--forge-accent-soft);
+    border: 1px solid rgba(175, 169, 236, 0.35);
+    border-radius: 9px;
+    transition: transform 0.22s ease;
+}
+.auth-tabs[data-mode='signup'] .auth-tab-thumb { transform: translateX(100%); }
+.auth-tab {
+    position: relative; z-index: 1; height: 38px;
+    background: none; border: none; cursor: pointer;
+    color: var(--forge-muted); font: inherit; font-size: 0.9rem; font-weight: 600;
+    transition: color 0.2s;
+}
+.auth-tab[aria-selected='true'] { color: var(--forge-text); }
+.auth-tab:focus-visible { outline: none; box-shadow: var(--forge-ring); border-radius: 9px; }
+
+.auth-alert {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 11px 13px; margin-bottom: 18px;
+    border-radius: 11px; font-size: 0.88rem; line-height: 1.45;
+}
+.auth-alert svg { flex-shrink: 0; margin-top: 1px; }
+.auth-alert.error   { background: var(--forge-danger-soft); border: 1px solid rgba(255, 90, 90, 0.35); color: #ffc2c2; }
+.auth-alert.success { background: var(--forge-ok-soft);     border: 1px solid rgba(52, 211, 153, 0.35); color: #b6f2d9; }
+
+.auth-form { display: grid; gap: 16px; }
+.auth-field { display: grid; gap: 7px; }
+.auth-field label { font-size: 0.82rem; font-weight: 600; color: #c9c9dc; }
+.auth-input-wrap { position: relative; }
+.auth-input-icon {
+    position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+    color: var(--forge-muted); pointer-events: none; display: flex;
+}
+.auth-input {
+    width: 100%; height: 48px;
+    padding: 0 44px 0 42px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--forge-line-strong);
+    border-radius: 12px;
+    color: var(--forge-text); font: inherit; font-size: 0.96rem;
+    transition: border-color 0.18s, box-shadow 0.18s, background 0.18s;
+}
+.auth-input::placeholder { color: #6d6d85; }
+.auth-input:hover { border-color: rgba(255, 255, 255, 0.28); }
+.auth-input:focus { outline: none; border-color: var(--forge-accent-hi); box-shadow: var(--forge-ring); background: rgba(255, 255, 255, 0.06); }
+.auth-input:-webkit-autofill { -webkit-text-fill-color: var(--forge-text); box-shadow: 0 0 0 100px #1b1b2e inset; }
+.auth-reveal {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    width: 36px; height: 36px; display: grid; place-items: center;
+    background: none; border: none; border-radius: 9px;
+    color: var(--forge-muted); cursor: pointer;
+}
+.auth-reveal:hover { color: var(--forge-text); background: rgba(255, 255, 255, 0.06); }
+.auth-reveal:focus-visible { outline: none; box-shadow: var(--forge-ring); }
+
+.auth-strength { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin-top: 2px; }
+.auth-strength span { height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.09); transition: background 0.2s; }
+.auth-strength[data-level='1'] span:nth-child(-n + 1) { background: #ff6b6b; }
+.auth-strength[data-level='2'] span:nth-child(-n + 2) { background: #ffb454; }
+.auth-strength[data-level='3'] span:nth-child(-n + 3) { background: #7ee7a8; }
+.auth-strength[data-level='4'] span                   { background: var(--forge-ok); }
+.auth-hint { font-size: 0.78rem; color: var(--forge-muted); }
+
+.auth-submit {
+    display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+    height: 50px; margin-top: 4px;
+    background: linear-gradient(135deg, var(--forge-accent-hi), var(--forge-accent));
+    border: none; border-radius: 12px;
+    color: #fff; font: inherit; font-size: 1rem; font-weight: 700; cursor: pointer;
+    box-shadow: 0 10px 28px rgba(83, 74, 183, 0.4);
+    transition: transform 0.15s, box-shadow 0.15s, filter 0.15s;
+}
+.auth-submit:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.08); box-shadow: 0 14px 34px rgba(83, 74, 183, 0.5); }
+.auth-submit:active:not(:disabled) { transform: translateY(0); }
+.auth-submit:focus-visible { outline: none; box-shadow: var(--forge-ring), 0 10px 28px rgba(83, 74, 183, 0.4); }
+.auth-submit:disabled { opacity: 0.65; cursor: progress; }
+
+.auth-switch { margin-top: 20px; text-align: center; font-size: 0.9rem; color: var(--forge-muted); }
+.auth-switch button {
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: var(--forge-accent-text); font: inherit; font-weight: 600;
+}
+.auth-switch button:hover { text-decoration: underline; }
+.auth-switch button:focus-visible { outline: none; box-shadow: var(--forge-ring); border-radius: 4px; }
+
+/* ── Responsive ──────────────────────────────────────────────── */
+@media (max-width: 960px) {
+    .auth-shell { grid-template-columns: 1fr; }
+    .auth-hero { padding: 24px 24px 0; border-right: none; gap: 0; }
+    .auth-hero-copy .auth-features, .auth-mock, .auth-lede { display: none; }
+    .auth-headline { font-size: 1.7rem; margin: 22px 0 0; }
+    .auth-panel { padding: 16px 16px 32px; align-items: start; }
+}
+@media (max-width: 480px) {
+    .auth-card { padding: 24px 20px; }
+}

@@ -44,6 +44,14 @@ export interface ChatMessage {
   role: 'user' | 'model';
   text: string;
   imageUrl?: string;
+  /** Document passages this answer was grounded in (RAG), e.g. "lecture3.pdf (p. 4)". */
+  sources?: string[];
+}
+
+/** A passage retrieved from the student's own documents. */
+export interface RetrievedPassage {
+  source: string;
+  text: string;
 }
 
 export interface LiveCallbacks {
@@ -111,7 +119,9 @@ export function encode(bytes: Uint8Array): string {
 
 export function createBlob(data: Float32Array): Blob {
   const int16 = new Int16Array(data.length);
-  for (let i = 0; i < data.length; i++) int16[i] = data[i] * 32768;
+  // Clamp first: a full-scale sample (1.0 × 32768) overflows Int16 and wraps to -32768,
+  // which is heard as a loud click.
+  for (let i = 0; i < data.length; i++) int16[i] = Math.max(-1, Math.min(1, data[i])) * 32767;
   return { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' };
 }
 
@@ -393,7 +403,15 @@ export const apiCreateChatForTopic = (topic: Topic): Chat | null => {
   return ai.chats.create({
     model: 'gemini-2.5-flash',
     config: {
-      systemInstruction: `You are an expert study assistant. Answer questions based only on the study notes for "${topic.topic}". Be concise and helpful.\n\nSTUDY NOTES:\n${topic.notes}`,
+      systemInstruction: `You are an expert study assistant for "${topic.topic}". Be concise and helpful.
+
+Some questions arrive with numbered EXCERPTS from the student's own uploaded documents. When excerpts are provided:
+- Base your answer on them first, and cite them like [1], [2] where you use them.
+- If the excerpts don't cover the question, say so briefly, then answer from the study notes below.
+Otherwise answer from the study notes below. Never invent details about the student's documents.
+
+STUDY NOTES:
+${topic.notes}`,
     },
     history: [],
   });
@@ -402,12 +420,16 @@ export const apiCreateChatForTopic = (topic: Topic): Chat | null => {
 export const apiChatWithDocumentsStream = async (
   chat: Chat,
   message: string,
-  imageFile?: File
+  imageFile?: File,
+  passages?: RetrievedPassage[]
 ): Promise<AsyncGenerator<GenerateContentResponse>> => {
   if (!chat) throw new Error("Chat not initialised.");
 
   const wordLimit = imageFile ? 250 : 230;
-  const fullMessage = `${message}\n\n(Keep response under ~${wordLimit} words.)`;
+  const excerpts = passages?.length
+    ? `EXCERPTS from the student's documents:\n${passages.map((p, i) => `[${i + 1}] (${p.source})\n${p.text}`).join('\n\n')}\n\n---\nStudent question: `
+    : '';
+  const fullMessage = `${excerpts}${message}\n\n(Keep response under ~${wordLimit} words.)`;
   const messageParts: Part[] = [{ text: fullMessage }];
 
   if (imageFile) {
@@ -440,4 +462,71 @@ STUDY NOTES:\n${topic.notes ?? 'No notes provided. Use general knowledge for thi
       outputAudioTranscription: {},
     },
   });
+};
+// --- RAG: TEXT EXTRACTION + EMBEDDINGS ---
+// Used by rag.ts to index the student's uploads for retrieval-augmented chat.
+const EMBEDDING_MODEL = 'gemini-embedding-001';
+const EMBEDDING_DIMS = 768;
+const EMBED_BATCH = 100; // API limit per embedContent request
+
+const withRetry = async <T>(fn: () => Promise<T>, tries = 4): Promise<T> => {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const transient = /429|RESOURCE_EXHAUSTED|quota|503|UNAVAILABLE|fetch/i.test(msg);
+      if (!transient || i >= tries - 1) throw e;
+      await new Promise(r => setTimeout(r, 1500 * 2 ** i));
+    }
+  }
+};
+
+const normalize = (v: number[]): Float32Array => {
+  const out = new Float32Array(v.length);
+  let norm = 0;
+  for (let i = 0; i < v.length; i++) norm += v[i] * v[i];
+  norm = Math.sqrt(norm) || 1;
+  // Truncated (outputDimensionality) embeddings are not unit length, so normalise here;
+  // cosine similarity then reduces to a plain dot product.
+  for (let i = 0; i < v.length; i++) out[i] = v[i] / norm;
+  return out;
+};
+
+export const apiEmbedTexts = async (
+  texts: string[],
+  taskType: 'RETRIEVAL_DOCUMENT' | 'RETRIEVAL_QUERY',
+  onBatch?: (done: number) => void
+): Promise<Float32Array[]> => {
+  const out: Float32Array[] = [];
+  for (let i = 0; i < texts.length; i += EMBED_BATCH) {
+    const batch = texts.slice(i, i + EMBED_BATCH);
+    const res = await withRetry(() => ai.models.embedContent({
+      model: EMBEDDING_MODEL,
+      contents: batch,
+      config: { taskType, outputDimensionality: EMBEDDING_DIMS },
+    }));
+    const embeddings = res.embeddings ?? [];
+    if (embeddings.length !== batch.length) throw new Error('Embedding count mismatch.');
+    for (const e of embeddings) out.push(normalize(e.values ?? []));
+    onBatch?.(out.length);
+  }
+  return out;
+};
+
+/** Plain text is read directly; PDFs, images and audio are transcribed by Gemini. */
+export const apiExtractDocumentText = async (file: File): Promise<string> => {
+  if (file.type === 'text/plain') return file.text();
+
+  const instruction = file.type.startsWith('audio/')
+    ? 'Transcribe this audio verbatim. Output only the transcript.'
+    : file.type.startsWith('image/')
+      ? 'Extract all text in this image verbatim. Then briefly describe any diagrams, charts or figures. Output only the extracted content.'
+      : 'Extract the full text of this document verbatim, in reading order. Start each page with a line that contains only [Page N] (N = page number). Write tables as plain text rows and briefly describe figures. Output only the extracted content.';
+
+  const part = await fileToGenerativePart(file);
+  const response = await withRetry(() => ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: [{ role: 'user', parts: [part, { text: instruction }] }],
+  }));
+  return response.text ?? '';
 };

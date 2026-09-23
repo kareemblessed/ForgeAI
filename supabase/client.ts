@@ -8,14 +8,22 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
-if (!supabaseUrl || !supabaseAnonKey) {
+/** False when .env.local is missing the Supabase keys — the app shows a setup notice. */
+export const supabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
+
+if (!supabaseConfigured) {
   console.warn(
     'Supabase environment variables are missing. ' +
     'Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your .env.local file.'
   );
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// createClient() throws on an empty URL, which used to blank the whole page at import
+// time. Placeholders let the app render its setup notice instead.
+export const supabase = createClient(
+  supabaseUrl || 'http://localhost:54321',
+  supabaseAnonKey || 'missing-anon-key'
+);
 
 // ── Type helpers ────────────────────────────────────────────
 

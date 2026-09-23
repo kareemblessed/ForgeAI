@@ -176,12 +176,22 @@ create policy "Authenticated users can ask AI questions"
 create policy "Service role can update AI answers"
   on public.shared_ai_messages for update using (auth.role() = 'service_role');
 
+-- The browser saves the AI answer itself (see ForgeRoom.tsx), so the asker must be
+-- allowed to update their own row — otherwise other members never receive the answer.
+create policy "Askers can save the answer to their own question"
+  on public.shared_ai_messages for update
+  using (auth.uid() = asked_by) with check (auth.uid() = asked_by);
+
 -- ── QUIZ policies ───────────────────────────────────────────
 create policy "Room members can view quiz sessions"
   on public.quiz_sessions for select using (auth.role() = 'authenticated');
 
 create policy "Authenticated users can create quiz sessions"
   on public.quiz_sessions for insert with check (auth.uid() = host_id);
+
+create policy "Host can update own quiz session"
+  on public.quiz_sessions for update
+  using (auth.uid() = host_id) with check (auth.uid() = host_id);
 
 create policy "Users can view all quiz answers in session"
   on public.quiz_answers for select using (auth.role() = 'authenticated');
@@ -233,7 +243,12 @@ begin
   insert into public.profiles (id, display_name)
   values (
     new.id,
-    coalesce(new.raw_user_meta_data->>'display_name', split_part(new.email, '@', 1))
+    -- Anonymous users have no email, so fall back to the column default name
+    coalesce(
+      nullif(new.raw_user_meta_data->>'display_name', ''),
+      nullif(split_part(coalesce(new.email, ''), '@', 1), ''),
+      'Student'
+    )
   );
   return new;
 end;
